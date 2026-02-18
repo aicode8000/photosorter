@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 from datetime import datetime
+from types import TracebackType
 
 IMAGE_EXTENSIONS = {
     ".jpg",
@@ -19,6 +20,7 @@ IMAGE_EXTENSIONS = {
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mts", ".avi", ".mkv"}
 
 LOGGER_NAME = "photosorter"
+READY_MARKER = "{ready}"
 
 
 def setup_logger(log_file: str | None) -> logging.Logger:
@@ -50,15 +52,8 @@ def is_video_file(file_path: str) -> bool:
     return os.path.splitext(file_path)[1].lower() in VIDEO_EXTENSIONS
 
 
-def get_date_taken(file_path: str, logger: logging.Logger) -> str | None:
-    try:
-        exiftool_command = ["exiftool", "-j", "-DateTimeOriginal", file_path]
-        result = subprocess.run(exiftool_command, check=True, text=True, capture_output=True)
-    except subprocess.CalledProcessError as exc:
-        logger.error("Exiftool failed for %s: %s", file_path, exc)
-        return None
-
-    output = result.stdout.strip()
+def extract_date_from_json(output: str, logger: logging.Logger, file_path: str) -> str | None:
+    output = output.strip()
     if not output:
         logger.warning("Exiftool returned empty JSON for %s", file_path)
         return None
@@ -73,11 +68,89 @@ def get_date_taken(file_path: str, logger: logging.Logger) -> str | None:
         logger.warning("Unexpected JSON structure from exiftool for %s", file_path)
         return None
 
-    date_taken = exif_data[0].get("DateTimeOriginal")
+    date_taken = (
+        exif_data[0].get("DateTimeOriginal")
+        or exif_data[0].get("CreateDate")
+        or exif_data[0].get("DateCreated")
+    )
     if not date_taken:
         return None
 
     return date_taken
+
+
+class ExifToolSession:
+    def __init__(self, logger: logging.Logger) -> None:
+        self.logger = logger
+        self.process = subprocess.Popen(
+            ["exiftool", "-stay_open", "True", "-@", "-"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+
+    def _write_lines(self, lines: list[str]) -> None:
+        if not self.process.stdin:
+            raise RuntimeError("Exiftool stdin is not available")
+        for line in lines:
+            self.process.stdin.write(line + "\n")
+        self.process.stdin.flush()
+
+    def _read_response(self) -> str:
+        if not self.process.stdout:
+            raise RuntimeError("Exiftool stdout is not available")
+        response_lines: list[str] = []
+        while True:
+            line = self.process.stdout.readline()
+            if line == "":
+                if self.process.poll() is not None:
+                    self.logger.error("Exiftool exited unexpectedly")
+                    break
+                continue
+            if line.strip() == READY_MARKER:
+                break
+            response_lines.append(line)
+        return "".join(response_lines)
+
+    def execute(self, args: list[str]) -> str:
+        if self.process.poll() is not None:
+            self.logger.error("Exiftool is not running")
+            return ""
+        try:
+            self._write_lines(args + ["-execute"])
+            return self._read_response()
+        except OSError as exc:
+            self.logger.error("Failed to communicate with exiftool: %s", exc)
+            return ""
+
+    def get_date_taken(self, file_path: str) -> str | None:
+        output = self.execute(["-j", "-DateTimeOriginal", "-CreateDate", "-DateCreated", file_path])
+        return extract_date_from_json(output, self.logger, file_path)
+
+    def close(self) -> None:
+        if self.process.poll() is not None:
+            return
+        try:
+            self._write_lines(["-stay_open", "False", "-execute"])
+        except OSError:
+            pass
+        try:
+            self.process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.process.terminate()
+
+    def __enter__(self) -> "ExifToolSession":
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        self.close()
 
 
 def create_unique_file_name(file_path: str) -> str:
@@ -88,9 +161,14 @@ def create_unique_file_name(file_path: str) -> str:
     return f"{name}_{counter}{extension}"
 
 
-def resolve_destination(file_path: str, destination_directory: str, logger: logging.Logger) -> str:
+def resolve_destination(
+    file_path: str,
+    destination_directory: str,
+    logger: logging.Logger,
+    session: ExifToolSession,
+) -> str:
     if is_image_file(file_path):
-        date_taken = get_date_taken(file_path, logger)
+        date_taken = session.get_date_taken(file_path)
         if date_taken is not None:
             try:
                 parsed_date = datetime.strptime(date_taken, "%Y:%m:%d %H:%M:%S")
@@ -112,8 +190,9 @@ def move_or_copy_file(
     logger: logging.Logger,
     dry_run: bool,
     copy_files: bool,
+    session: ExifToolSession,
 ) -> None:
-    destination_path = resolve_destination(file_path, destination_directory, logger)
+    destination_path = resolve_destination(file_path, destination_directory, logger, session)
     destination_file = os.path.join(destination_path, os.path.basename(file_path))
 
     if os.path.exists(destination_file):
@@ -161,16 +240,23 @@ def main() -> int:
     if not os.path.exists(args.destination_directory):
         os.makedirs(args.destination_directory)
 
-    for root, _, files in os.walk(args.source_directory):
-        for file_name in files:
-            file_path = os.path.join(root, file_name)
-            move_or_copy_file(
-                file_path,
-                args.destination_directory,
-                logger,
-                dry_run=args.dry_run,
-                copy_files=args.copy,
-            )
+    try:
+        with ExifToolSession(logger) as session:
+            for root, _, files in os.walk(args.source_directory):
+                for file_name in files:
+                    file_path = os.path.join(root, file_name)
+                    move_or_copy_file(
+                        file_path,
+                        args.destination_directory,
+                        logger,
+                        dry_run=args.dry_run,
+                        copy_files=args.copy,
+                        session=session,
+                    )
+    except OSError as exc:
+        logger.error("Failed to start exiftool: %s", exc)
+        return 1
+
     return 0
 
 
