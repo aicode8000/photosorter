@@ -180,7 +180,16 @@ def resolve_destination(
                 logger.warning("Invalid DateTimeOriginal for %s: %s", file_path, exc)
         return os.path.join(destination_directory, "Non_classee")
     if is_video_file(file_path):
-        return os.path.join(destination_directory, "Videos")
+        date_taken = session.get_date_taken(file_path)
+        if date_taken is not None:
+            try:
+                parsed_date = datetime.strptime(date_taken, "%Y:%m:%d %H:%M:%S")
+                return os.path.join(destination_directory, str(parsed_date.year), "Videos")
+            except ValueError as exc:
+                logger.warning("Invalid video date for %s: %s", file_path, exc)
+
+        modified_year = datetime.fromtimestamp(os.path.getmtime(file_path)).year
+        return os.path.join(destination_directory, str(modified_year), "Videos")
     return os.path.join(destination_directory, "Non_classee")
 
 

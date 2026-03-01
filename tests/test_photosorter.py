@@ -1,6 +1,8 @@
 import argparse
 import logging
+import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -93,6 +95,29 @@ def test_move_or_copy_file_copy(tmp_path):
     )
 
     expected = destination_root / "2020" / "01" / "JPG" / "photo.jpg"
+    assert source.exists()
+    assert expected.exists()
+
+
+def test_move_or_copy_video_uses_year_videos(tmp_path):
+    logger = make_logger()
+    source = tmp_path / "clip.mp4"
+    source.write_text("data")
+    timestamp = datetime(2021, 6, 7, 8, 9, 10).timestamp()
+    os.utime(source, (timestamp, timestamp))
+
+    session = FakeSession(None)
+    destination_root = tmp_path / "dest"
+    photosorter.move_or_copy_file(
+        str(source),
+        str(destination_root),
+        logger,
+        dry_run=False,
+        copy_files=True,
+        session=session,
+    )
+
+    expected = destination_root / "2021" / "Videos" / "clip.mp4"
     assert source.exists()
     assert expected.exists()
 
