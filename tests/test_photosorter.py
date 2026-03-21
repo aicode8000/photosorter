@@ -18,6 +18,15 @@ def make_logger() -> logging.Logger:
     return logger
 
 
+class MessageCollector(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__()
+        self.messages: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.messages.append(record.getMessage())
+
+
 class FakeSession:
     def __init__(self, date_taken: str | None):
         self.date_taken = date_taken
@@ -120,6 +129,50 @@ def test_move_or_copy_video_uses_year_videos(tmp_path):
     expected = destination_root / "2021" / "Videos" / "clip.mp4"
     assert source.exists()
     assert expected.exists()
+
+
+def test_move_or_copy_skips_missing_file(tmp_path):
+    logger = make_logger()
+    collector = MessageCollector()
+    logger.addHandler(collector)
+    destination_root = tmp_path / "dest"
+
+    photosorter.move_or_copy_file(
+        str(tmp_path / "missing.mp4"),
+        str(destination_root),
+        logger,
+        dry_run=False,
+        copy_files=True,
+        session=FakeSession(None),
+    )
+
+    assert not destination_root.exists()
+    assert "Skipping missing or unsupported file" in collector.messages[0]
+
+
+def test_move_or_copy_skips_file_that_disappears_during_processing(monkeypatch, tmp_path):
+    logger = make_logger()
+    collector = MessageCollector()
+    logger.addHandler(collector)
+
+    source = tmp_path / "clip.mp4"
+    source.write_text("data")
+
+    def missing_file(_file_path: str) -> float:
+        raise FileNotFoundError
+
+    monkeypatch.setattr(photosorter.os.path, "getmtime", missing_file)
+
+    photosorter.move_or_copy_file(
+        str(source),
+        str(tmp_path / "dest"),
+        logger,
+        dry_run=False,
+        copy_files=True,
+        session=FakeSession(None),
+    )
+
+    assert "Skipping file that disappeared during processing" in collector.messages[-1]
 
 
 def test_main_uses_single_mocked_session(monkeypatch, tmp_path):

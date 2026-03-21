@@ -201,25 +201,31 @@ def move_or_copy_file(
     copy_files: bool,
     session: ExifToolSession,
 ) -> None:
-    destination_path = resolve_destination(file_path, destination_directory, logger, session)
-    destination_file = os.path.join(destination_path, os.path.basename(file_path))
-
-    if os.path.exists(destination_file):
-        destination_file = create_unique_file_name(destination_file)
-
-    operation = "copy" if copy_files else "move"
-    if dry_run:
-        logger.info("Dry run: %s %s -> %s", operation, file_path, destination_file)
+    if not os.path.isfile(file_path):
+        logger.warning("Skipping missing or unsupported file: %s", file_path)
         return
 
-    os.makedirs(destination_path, exist_ok=True)
-
+    operation = "copy" if copy_files else "move"
     try:
+        destination_path = resolve_destination(file_path, destination_directory, logger, session)
+        destination_file = os.path.join(destination_path, os.path.basename(file_path))
+
+        if os.path.exists(destination_file):
+            destination_file = create_unique_file_name(destination_file)
+
+        if dry_run:
+            logger.info("Dry run: %s %s -> %s", operation, file_path, destination_file)
+            return
+
+        os.makedirs(destination_path, exist_ok=True)
+
         if copy_files:
             shutil.copy2(file_path, destination_file)
         else:
             shutil.move(file_path, destination_file)
         logger.info("%s: %s -> %s", operation.capitalize(), file_path, destination_file)
+    except FileNotFoundError:
+        logger.warning("Skipping file that disappeared during processing: %s", file_path)
     except PermissionError as exc:
         logger.error("Permission error for %s: %s", file_path, exc)
     except OSError as exc:
@@ -250,7 +256,13 @@ def main() -> int:
         os.makedirs(args.destination_directory)
 
     try:
-        with ExifToolSession(logger) as session:
+        session = ExifToolSession(logger)
+    except OSError as exc:
+        logger.error("Failed to start exiftool: %s", exc)
+        return 1
+
+    try:
+        with session:
             for root, _, files in os.walk(args.source_directory):
                 for file_name in files:
                     file_path = os.path.join(root, file_name)
@@ -263,7 +275,7 @@ def main() -> int:
                         session=session,
                     )
     except OSError as exc:
-        logger.error("Failed to start exiftool: %s", exc)
+        logger.error("Failed while processing files: %s", exc)
         return 1
 
     return 0
