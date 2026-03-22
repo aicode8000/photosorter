@@ -2,10 +2,14 @@ import argparse
 import json
 import logging
 import os
+import queue
 import shutil
 import subprocess
+import threading
+import time
 from datetime import datetime
 from types import TracebackType
+from typing import TextIO
 
 IMAGE_EXTENSIONS = {
     ".jpg",
@@ -80,8 +84,14 @@ def extract_date_from_json(output: str, logger: logging.Logger, file_path: str) 
 
 
 class ExifToolSession:
-    def __init__(self, logger: logging.Logger) -> None:
+    def __init__(self, logger: logging.Logger, command_timeout: float = 30.0) -> None:
         self.logger = logger
+        self.command_timeout = command_timeout
+        self.process: subprocess.Popen[str]
+        self.stdout_queue: queue.Queue[str | None]
+        self._start_process()
+
+    def _start_process(self) -> None:
         self.process = subprocess.Popen(
             ["exiftool", "-stay_open", "True", "-@", "-"],
             stdin=subprocess.PIPE,
@@ -90,6 +100,41 @@ class ExifToolSession:
             text=True,
             bufsize=1,
         )
+        self.stdout_queue = queue.Queue()
+        threading.Thread(
+            target=self._drain_stdout,
+            args=(self.process.stdout, self.stdout_queue),
+            name="exiftool-stdout",
+            daemon=True,
+        ).start()
+        threading.Thread(
+            target=self._drain_stderr,
+            args=(self.process.stderr,),
+            name="exiftool-stderr",
+            daemon=True,
+        ).start()
+
+    def _drain_stdout(
+        self,
+        stdout: TextIO | None = None,
+        stdout_queue: queue.Queue[str | None] | None = None,
+    ) -> None:
+        stdout = stdout or self.process.stdout
+        stdout_queue = stdout_queue or self.stdout_queue
+        if not stdout:
+            return
+        for line in stdout:
+            stdout_queue.put(line)
+        stdout_queue.put(None)
+
+    def _drain_stderr(self, stderr: TextIO | None = None) -> None:
+        stderr = stderr or self.process.stderr
+        if not stderr:
+            return
+        for line in stderr:
+            message = line.strip()
+            if message:
+                self.logger.warning("Exiftool stderr: %s", message)
 
     def _write_lines(self, lines: list[str]) -> None:
         if not self.process.stdin:
@@ -98,17 +143,49 @@ class ExifToolSession:
             self.process.stdin.write(line + "\n")
         self.process.stdin.flush()
 
-    def _read_response(self) -> str:
-        if not self.process.stdout:
-            raise RuntimeError("Exiftool stdout is not available")
+    def _terminate_process(self) -> None:
+        if self.process.poll() is not None:
+            return
+        self.process.terminate()
+        try:
+            self.process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait(timeout=5)
+
+    def _read_response(self, request_target: str) -> str:
         response_lines: list[str] = []
+        deadline = time.monotonic() + self.command_timeout
         while True:
-            line = self.process.stdout.readline()
-            if line == "":
-                if self.process.poll() is not None:
-                    self.logger.error("Exiftool exited unexpectedly")
-                    break
-                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self.logger.error(
+                    "Exiftool timed out after %.1f seconds while processing %s",
+                    self.command_timeout,
+                    request_target,
+                )
+                self._terminate_process()
+                return ""
+
+            try:
+                line = self.stdout_queue.get(timeout=remaining)
+            except queue.Empty:
+                self.logger.error(
+                    "Exiftool timed out after %.1f seconds while processing %s",
+                    self.command_timeout,
+                    request_target,
+                )
+                self._terminate_process()
+                return ""
+
+            if line is None:
+                if self.process.poll() is None:
+                    try:
+                        self.process.wait(timeout=min(1.0, remaining))
+                    except subprocess.TimeoutExpired:
+                        continue
+                self.logger.error("Exiftool exited unexpectedly while processing %s", request_target)
+                break
             if line.strip() == READY_MARKER:
                 break
             response_lines.append(line)
@@ -116,13 +193,19 @@ class ExifToolSession:
 
     def execute(self, args: list[str]) -> str:
         if self.process.poll() is not None:
-            self.logger.error("Exiftool is not running")
-            return ""
+            self.logger.warning("Exiftool is not running, restarting session")
+            try:
+                self._start_process()
+            except OSError as exc:
+                self.logger.error("Failed to restart exiftool: %s", exc)
+                return ""
         try:
             self._write_lines(args + ["-execute"])
-            return self._read_response()
+            request_target = args[-1] if args else "request"
+            return self._read_response(request_target)
         except OSError as exc:
             self.logger.error("Failed to communicate with exiftool: %s", exc)
+            self._terminate_process()
             return ""
 
     def get_date_taken(self, file_path: str) -> str | None:
@@ -139,7 +222,7 @@ class ExifToolSession:
         try:
             self.process.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            self.process.terminate()
+            self._terminate_process()
 
     def __enter__(self) -> "ExifToolSession":
         return self

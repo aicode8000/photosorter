@@ -1,6 +1,8 @@
 import argparse
+import io
 import logging
 import os
+import queue
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -35,6 +37,32 @@ class FakeSession:
         return self.date_taken
 
 
+class FakeProcess:
+    def __init__(self, returncode: int | None = None) -> None:
+        self.stdin = io.StringIO()
+        self.stdout = io.StringIO()
+        self.stderr = io.StringIO()
+        self.returncode = returncode
+        self.terminate_called = False
+        self.kill_called = False
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def wait(self, timeout: float | None = None) -> int:
+        if self.returncode is None:
+            raise photosorter.subprocess.TimeoutExpired(cmd="exiftool", timeout=timeout)
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.terminate_called = True
+        self.returncode = 1
+
+    def kill(self) -> None:
+        self.kill_called = True
+        self.returncode = 1
+
+
 def test_extract_date_parses_datetimeoriginal():
     logger = make_logger()
     output = '[{"DateTimeOriginal":"2020:05:01 10:11:12"}]'
@@ -65,6 +93,78 @@ def test_extract_date_fallback_datecreated():
 def test_extract_date_invalid_json():
     logger = make_logger()
     assert photosorter.extract_date_from_json("not json", logger, "/tmp/file.jpg") is None
+
+
+def test_exiftool_session_reads_until_ready_marker():
+    logger = make_logger()
+    session = photosorter.ExifToolSession.__new__(photosorter.ExifToolSession)
+    session.logger = logger
+    session.command_timeout = 0.1
+    session.process = FakeProcess()
+    session.stdout_queue = queue.Queue()
+    session.stdout_queue.put('[{"DateTimeOriginal":"2020:05:01 10:11:12"}]\n')
+    session.stdout_queue.put(f"{photosorter.READY_MARKER}\n")
+
+    assert session._read_response("/tmp/file.jpg") == '[{"DateTimeOriginal":"2020:05:01 10:11:12"}]\n'
+
+
+def test_exiftool_session_times_out_and_terminates_process():
+    logger = make_logger()
+    collector = MessageCollector()
+    logger.addHandler(collector)
+
+    session = photosorter.ExifToolSession.__new__(photosorter.ExifToolSession)
+    session.logger = logger
+    session.command_timeout = 0.01
+    session.process = FakeProcess()
+    session.stdout_queue = queue.Queue()
+
+    assert session._read_response("/tmp/stuck.jpg") == ""
+    assert session.process.terminate_called is True
+    assert "timed out" in collector.messages[-1]
+
+
+def test_exiftool_session_logs_stderr_lines():
+    logger = make_logger()
+    collector = MessageCollector()
+    logger.addHandler(collector)
+
+    session = photosorter.ExifToolSession.__new__(photosorter.ExifToolSession)
+    session.logger = logger
+    session.process = FakeProcess()
+    session.process.stderr = io.StringIO("Warning 1\nWarning 2\n")
+
+    session._drain_stderr()
+
+    assert collector.messages == ["Exiftool stderr: Warning 1", "Exiftool stderr: Warning 2"]
+
+
+def test_exiftool_session_restarts_dead_process(monkeypatch):
+    logger = make_logger()
+    collector = MessageCollector()
+    logger.addHandler(collector)
+
+    session = photosorter.ExifToolSession.__new__(photosorter.ExifToolSession)
+    session.logger = logger
+    session.command_timeout = 0.1
+    session.process = FakeProcess(returncode=1)
+
+    started: list[bool] = []
+    written: list[str] = []
+
+    def fake_start_process() -> None:
+        started.append(True)
+        session.process = FakeProcess()
+        session.stdout_queue = queue.Queue()
+        session.stdout_queue.put(f"{photosorter.READY_MARKER}\n")
+
+    monkeypatch.setattr(session, "_start_process", fake_start_process)
+    monkeypatch.setattr(session, "_write_lines", lambda lines: written.extend(lines))
+
+    assert session.execute(["-j", "/tmp/file.jpg"]) == ""
+    assert started == [True]
+    assert written == ["-j", "/tmp/file.jpg", "-execute"]
+    assert "restarting session" in collector.messages[0]
 
 
 def test_move_or_copy_file_dry_run(tmp_path):
