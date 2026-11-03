@@ -1,5 +1,6 @@
 import argparse
 import filecmp
+import hashlib
 import json
 import logging
 import os
@@ -10,6 +11,7 @@ import subprocess
 import threading
 import time
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from types import TracebackType
@@ -43,8 +45,10 @@ VIDEO_EXTENSIONS = {
 }
 # Files that only make sense next to their photo: XMP metadata, iOS edits, DxO PhotoLab settings.
 SIDECAR_EXTENSIONS = {".xmp", ".aae", ".dop"}
-# Video half of an Apple Live Photo (IMG_0001.HEIC + IMG_0001.MOV).
-LIVE_PHOTO_VIDEO_EXTENSIONS = {".mov"}
+# Video half of an Apple Live Photo (IMG_0001.HEIC + IMG_0001.MOV, or .MP4 in Google Takeout).
+# Paired by name, confirmed by ContentIdentifier; only .MOV is paired on the name alone.
+LIVE_PHOTO_VIDEO_EXTENSIONS = {".mov", ".mp4"}
+NAME_ONLY_LIVE_PHOTO_EXTENSIONS = {".mov"}
 # Folder names are the extension in upper case, with aliases merged into a single folder.
 EXTENSION_FOLDER_ALIASES = {"JPEG": "JPG", "HEIF": "HEIC", "TIF": "TIFF"}
 # Hidden/system directories: macOS (.Trashes…), QNAP (.@__thumb, @Recycle), Synology (@eaDir…).
@@ -58,6 +62,9 @@ READY_MARKER = "{ready}"
 # CreationDate (QuickTime Keys, written by iPhones) carries the local time and time zone,
 # so it is preferred over CreateDate for videos.
 DATE_TAGS = ("DateTimeOriginal", "CreationDate", "CreateDate", "DateCreated")
+# Shared by both halves of a Live Photo (Apple MakerNotes / QuickTime Keys).
+CONTENT_ID_TAG = "ContentIdentifier"
+METADATA_TAGS = (*DATE_TAGS, CONTENT_ID_TAG)
 # Accepts "YYYY:MM:DD HH:MM:SS" plus optional sub-seconds / timezone suffix, or a bare date.
 EXIF_DATE_RE = re.compile(r"^\s*(\d{4})[:-](\d{2})[:-](\d{2})(?:[ T](\d{2}):(\d{2}):(\d{2}))?")
 
@@ -109,27 +116,29 @@ def parse_exif_date(value: object) -> datetime | None:
         return None
 
 
-def extract_date_from_json(
-    output: str, logger: logging.Logger, file_path: str
-) -> datetime | None:
+def parse_exiftool_json(output: str, logger: logging.Logger, file_path: str) -> dict:
+    """Return the tags exiftool reported for one file ({} when unusable)."""
     output = output.strip()
     if not output:
         logger.warning("Exiftool returned empty JSON for %s", file_path)
-        return None
+        return {}
 
     try:
         exif_data = json.loads(output)
     except json.JSONDecodeError as exc:
         logger.warning("Invalid JSON from exiftool for %s: %s", file_path, exc)
-        return None
+        return {}
 
     if not isinstance(exif_data, list) or not exif_data or not isinstance(exif_data[0], dict):
         logger.warning("Unexpected JSON structure from exiftool for %s", file_path)
-        return None
+        return {}
+    return exif_data[0]
 
+
+def date_from_tags(tags: dict, logger: logging.Logger, file_path: str) -> datetime | None:
     invalid_values = []
     for tag in DATE_TAGS:
-        value = exif_data[0].get(tag)
+        value = tags.get(tag)
         if value is None:
             continue
         parsed = parse_exif_date(value)
@@ -146,6 +155,7 @@ class ExifToolSession:
     def __init__(self, logger: logging.Logger, command_timeout: float = 30.0) -> None:
         self.logger = logger
         self.command_timeout = command_timeout
+        self._tags_cache: dict[str, dict] = {}
         self.process: subprocess.Popen[str]
         self.stdout_queue: queue.Queue[str | None]
         self._start_process()
@@ -258,12 +268,25 @@ class ExifToolSession:
         request_target = args[-1] if args else "request"
         return self._read_response(request_target)
 
+    def read_tags(self, file_path: str) -> dict:
+        """Read the date and Live Photo tags of a file, once (see clear_cache)."""
+        if file_path not in self._tags_cache:
+            # QuickTime dates are UTC by spec: QuickTimeUTC converts them to local time.
+            output = self.execute(
+                ["-j", "-api", "QuickTimeUTC", *(f"-{tag}" for tag in METADATA_TAGS), file_path]
+            )
+            self._tags_cache[file_path] = parse_exiftool_json(output, self.logger, file_path)
+        return self._tags_cache[file_path]
+
+    def clear_cache(self) -> None:
+        self._tags_cache.clear()
+
     def get_date_taken(self, file_path: str) -> datetime | None:
-        # QuickTime dates are UTC by spec: QuickTimeUTC converts them to local time.
-        output = self.execute(
-            ["-j", "-api", "QuickTimeUTC", *(f"-{tag}" for tag in DATE_TAGS), file_path]
-        )
-        return extract_date_from_json(output, self.logger, file_path)
+        return date_from_tags(self.read_tags(file_path), self.logger, file_path)
+
+    def get_content_identifier(self, file_path: str) -> str | None:
+        value = self.read_tags(file_path).get(CONTENT_ID_TAG)
+        return str(value) if value else None
 
     def close(self) -> None:
         if self.process.poll() is not None:
@@ -311,8 +334,38 @@ def split_name(file_name: str) -> tuple[str, str]:
     return stem.lower(), extension.lower()
 
 
+LivePhotoMatcher = Callable[[str, str], bool]
+
+
+def match_live_photo_by_name(_image: str, video: str) -> bool:
+    return split_name(video)[1] in NAME_ONLY_LIVE_PHOTO_EXTENSIONS
+
+
+def live_photo_matcher(session: ExifToolSession) -> LivePhotoMatcher:
+    """Confirm a same-named photo/video pair with the Live Photo ContentIdentifier.
+
+    Both identifiers present: they must be equal. Otherwise fall back to the name rule
+    (.MOV only), as files re-encoded or exported by other tools may have lost them.
+    """
+
+    def matches(image: str, video: str) -> bool:
+        try:
+            image_id = session.get_content_identifier(image)
+            video_id = session.get_content_identifier(video) if image_id else None
+        except ExifToolError:
+            # The photo will fail again, and be skipped, when it is sorted.
+            return match_live_photo_by_name(image, video)
+        if image_id and video_id:
+            return image_id == video_id
+        return match_live_photo_by_name(image, video)
+
+    return matches
+
+
 def group_directory_files(
-    directory: str, file_names: list[str]
+    directory: str,
+    file_names: list[str],
+    is_live_photo: LivePhotoMatcher = match_live_photo_by_name,
 ) -> tuple[list[MediaGroup], list[str]]:
     """Group the media files of one directory with their sidecars and Live Photo videos.
 
@@ -339,9 +392,11 @@ def group_directory_files(
         stem, extension = split_name(name)
         if extension not in LIVE_PHOTO_VIDEO_EXTENSIONS:
             continue
+        video = groups[name].main
         stills = [i for i in images_by_stem.get(stem, []) if split_name(i)[1] not in RAW_EXTENSIONS]
-        if stills:
-            groups[stills[0]].companions.append(groups.pop(name).main)
+        owner = next((i for i in stills if is_live_photo(groups[i].main, video)), None)
+        if owner is not None:
+            groups[owner].companions.append(groups.pop(name).main)
 
     untouched: list[str] = []
     for name in sidecars:
@@ -395,21 +450,97 @@ def same_content(path_a: str, path_b: str) -> bool:
     )
 
 
+def file_digest(path: str) -> str:
+    with open(path, "rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
+
+
+class DestinationIndex:
+    """What the destination holds, to find identical files whatever their name.
+
+    Sizes are collected up front (one stat per file); SHA-256 digests are computed only
+    for files of the same size, and cached. Files sorted during the run are added as they
+    are planned, so that a dry-run behaves like the real run.
+    """
+
+    def __init__(self) -> None:
+        # target -> file holding its content (in dry-run the source, nothing is written).
+        self.planned: dict[str, str] = {}
+        self._by_size: dict[int, list[tuple[str, str]]] = {}
+        self._digests: dict[str, str] = {}
+
+    @classmethod
+    def scan(cls, destination: str, excluded: str) -> "DestinationIndex":
+        """Index the destination, skipping system folders and `excluded` (the source)."""
+        index = cls()
+        for root, dirs, files in os.walk(destination):
+            dirs[:] = [
+                d
+                for d in dirs
+                if not is_ignored_directory(d) and not is_same_path(os.path.join(root, d), excluded)
+            ]
+            for name in files:
+                if not is_junk_file(name):
+                    path = os.path.join(root, name)
+                    index._add(path, path)
+        return index
+
+    def __len__(self) -> int:
+        return sum(len(entries) for entries in self._by_size.values())
+
+    def _add(self, target: str, content: str) -> None:
+        try:
+            size = os.path.getsize(content)
+        except OSError:
+            return
+        self._by_size.setdefault(size, []).append((target, content))
+
+    def _digest(self, path: str) -> str:
+        if path not in self._digests:
+            self._digests[path] = file_digest(path)
+        return self._digests[path]
+
+    def occupant(self, target: str) -> str | None:
+        """The file holding what is (or will be) at `target`, None if it is free."""
+        return target if os.path.exists(target) else self.planned.get(target)
+
+    def find_identical(self, source: str) -> str | None:
+        """Return the destination path of a file identical to `source`, if any."""
+        candidates = self._by_size.get(os.path.getsize(source))
+        if not candidates:
+            return None
+        digest = self._digest(source)
+        for target, content in candidates:
+            try:
+                if content != source and self._digest(content) == digest:
+                    return target
+            except OSError:
+                continue
+        return None
+
+    def add(self, target: str, source: str, dry_run: bool) -> None:
+        content = source if dry_run else target
+        if source in self._digests:
+            self._digests[content] = self._digests[source]
+        self.planned[target] = content
+        self._add(target, content)
+
+
 def find_target(
-    source_file: str, target_file: str, planned: dict[str, str] | None = None
+    source_file: str, target_file: str, index: DestinationIndex | None = None
 ) -> tuple[str, bool]:
     """Return a free target path, or (existing path, True) if an identical copy is there.
 
-    Identical copies are looked for under the same name and its "_N" variants, so that
-    re-running the sorter on the same files does nothing. `planned` maps targets already
-    claimed during this run to their source file: in dry-run nothing is written, so this
-    is what keeps two same-named files from being shown the same destination.
+    Identical copies are looked for under the same name and its "_N" variants. The index
+    also counts targets already claimed during this run (dry-run writes nothing).
     """
-    planned = planned or {}
     name, extension = os.path.splitext(target_file)
     candidate, counter = target_file, 0
     while True:
-        occupant = candidate if os.path.exists(candidate) else planned.get(candidate)
+        if index is not None:
+            occupant = index.occupant(candidate)
+        else:
+            occupant = candidate if os.path.exists(candidate) else None
         if occupant is None:
             return candidate, False
         if same_content(source_file, occupant):
@@ -435,13 +566,13 @@ def process_group(
     dry_run: bool,
     copy_files: bool,
     session: ExifToolSession,
-    planned: dict[str, str] | None = None,
+    index: DestinationIndex | None = None,
 ) -> str:
     """Sort one group. Returns the outcome: sorted, unclassified, duplicate or error.
 
-    `planned` (target -> source) is updated with every transfer, see find_target().
+    `index` describes the destination; every transfer is added to it.
     """
-    planned = {} if planned is None else planned
+    index = DestinationIndex() if index is None else index
     file_path = group.main
     if not os.path.isfile(file_path):
         logger.warning("Skipping missing or unsupported file: %s", file_path)
@@ -450,9 +581,14 @@ def process_group(
     operation = "copy" if copy_files else "move"
     transfer = shutil.copy2 if copy_files else shutil.move
     try:
+        identical = index.find_identical(file_path)
+        if identical is not None:
+            logger.info("Duplicate, left in place: %s (same as %s)", file_path, identical)
+            return "duplicate"
+
         destination_path = resolve_destination(file_path, destination_directory, session)
         main_target, duplicate = find_target(
-            file_path, os.path.join(destination_path, os.path.basename(file_path)), planned
+            file_path, os.path.join(destination_path, os.path.basename(file_path)), index
         )
         if duplicate:
             logger.info("Duplicate, left in place: %s (same as %s)", file_path, main_target)
@@ -461,7 +597,7 @@ def process_group(
         transfers = [(file_path, main_target)]
         for companion in group.companions:
             target, duplicate = find_target(
-                companion, companion_target(companion, file_path, main_target), planned
+                companion, companion_target(companion, file_path, main_target), index
             )
             if duplicate:
                 logger.info("Duplicate, left in place: %s (same as %s)", companion, target)
@@ -469,13 +605,13 @@ def process_group(
                 transfers.append((companion, target))
 
         for source, target in transfers:
-            planned[target] = source
             if dry_run:
                 logger.info("Dry run: %s %s -> %s", operation, source, target)
-                continue
-            os.makedirs(os.path.dirname(target), exist_ok=True)
-            transfer(source, target)
-            logger.info("%s: %s -> %s", operation.capitalize(), source, target)
+            else:
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                transfer(source, target)
+                logger.info("%s: %s -> %s", operation.capitalize(), source, target)
+            index.add(target, source, dry_run)
     except ExifToolError as exc:
         # Unknown date is not "no date": leave the file in place rather than misfile it.
         logger.error("Skipping %s, exiftool failed: %s", file_path, exc)
@@ -588,10 +724,12 @@ def main() -> int:
         return 1
 
     stats: Counter[str] = Counter()
-    planned: dict[str, str] = {}
     emptied_directories: set[str] = set()
     try:
+        index = DestinationIndex.scan(destination, excluded=source)
+        logger.info("Indexed %d files already in %s", len(index), destination)
         with session:
+            is_live_photo = live_photo_matcher(session)
             for root, dirs, files in os.walk(source):
                 # Skip system folders, and never re-sort a destination nested in the source.
                 dirs[:] = sorted(
@@ -600,7 +738,7 @@ def main() -> int:
                     if not is_ignored_directory(d)
                     and not is_same_path(os.path.join(root, d), destination)
                 )
-                groups, untouched = group_directory_files(root, files)
+                groups, untouched = group_directory_files(root, files, is_live_photo)
                 for path in untouched:
                     logger.info("Not a media file, left in place: %s", path)
                 stats["ignored"] += len(untouched)
@@ -612,11 +750,12 @@ def main() -> int:
                         dry_run=args.dry_run,
                         copy_files=args.copy,
                         session=session,
-                        planned=planned,
+                        index=index,
                     )
                     stats[outcome] += 1
                     if outcome in ("sorted", "unclassified"):
                         emptied_directories.add(root)
+                session.clear_cache()
     except OSError as exc:
         logger.error("Failed while processing files: %s", exc)
         return 1

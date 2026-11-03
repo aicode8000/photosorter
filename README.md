@@ -15,8 +15,8 @@ Photo/video sorter using ExifTool.
 | Photo sans date EXIF/XMP | `Non_classee/` |
 | Vidéo | `AAAA/Videos/` (date des métadonnées, sinon date du fichier) |
 | Sidecar `.xmp`, `.aae`, `.dop` | suit sa photo (même dossier, même renommage) |
-| `.MOV` d'une Live Photo | à côté de sa photo |
-| Doublon identique déjà présent | laissé dans la source |
+| Vidéo d'une Live Photo (même nom ; `ContentIdentifier` vérifié s'il existe, obligatoire pour un `.MP4`) | à côté de sa photo |
+| Doublon identique déjà présent, quel que soit son nom | laissé dans la source |
 | Autre fichier (`.txt`, `.pdf`, sidecar orphelin…) | laissé dans la source |
 
 Les fichiers et dossiers système (`.DS_Store`, `Thumbs.db`, `.@__thumb`, `@eaDir`…)

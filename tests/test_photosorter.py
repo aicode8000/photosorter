@@ -22,6 +22,11 @@ def make_logger() -> logging.Logger:
     return logger
 
 
+def extract_date(output: str, logger: logging.Logger) -> datetime | None:
+    tags = photosorter.parse_exiftool_json(output, logger, "/tmp/file.jpg")
+    return photosorter.date_from_tags(tags, logger, "/tmp/file.jpg")
+
+
 class MessageCollector(logging.Handler):
     def __init__(self) -> None:
         super().__init__()
@@ -42,6 +47,8 @@ class FakeSession:
 class FailingSession:
     def get_date_taken(self, file_path: str) -> datetime | None:
         raise photosorter.ExifToolError(f"exiftool timed out while processing {file_path}")
+
+    get_content_identifier = get_date_taken
 
 
 class FakeProcess:
@@ -74,7 +81,7 @@ def test_extract_date_parses_datetimeoriginal():
     logger = make_logger()
     output = '[{"DateTimeOriginal":"2020:05:01 10:11:12"}]'
     assert (
-        photosorter.extract_date_from_json(output, logger, "/tmp/file.jpg")
+        extract_date(output, logger)
         == datetime(2020, 5, 1, 10, 11, 12)
     )
 
@@ -83,7 +90,7 @@ def test_extract_date_fallback_createdate():
     logger = make_logger()
     output = '[{"CreateDate":"2019:04:03 02:01:00"}]'
     assert (
-        photosorter.extract_date_from_json(output, logger, "/tmp/file.jpg")
+        extract_date(output, logger)
         == datetime(2019, 4, 3, 2, 1, 0)
     )
 
@@ -92,20 +99,20 @@ def test_extract_date_fallback_datecreated():
     logger = make_logger()
     output = '[{"DateCreated":"2018:07:09 12:13:14"}]'
     assert (
-        photosorter.extract_date_from_json(output, logger, "/tmp/file.jpg")
+        extract_date(output, logger)
         == datetime(2018, 7, 9, 12, 13, 14)
     )
 
 
 def test_extract_date_invalid_json():
     logger = make_logger()
-    assert photosorter.extract_date_from_json("not json", logger, "/tmp/file.jpg") is None
+    assert extract_date("not json", logger) is None
 
 
 def test_extract_date_skips_zero_date_and_falls_back():
     logger = make_logger()
     output = '[{"DateTimeOriginal":"0000:00:00 00:00:00","CreateDate":"2019:03:01 08:00:00"}]'
-    assert photosorter.extract_date_from_json(output, logger, "/tmp/file.jpg") == datetime(
+    assert extract_date(output, logger) == datetime(
         2019, 3, 1, 8, 0, 0
     )
 
@@ -116,7 +123,7 @@ def test_extract_date_returns_none_when_all_dates_invalid():
     logger.addHandler(collector)
     output = '[{"DateTimeOriginal":"0000:00:00 00:00:00","CreateDate":"    :  :     :  :  "}]'
 
-    assert photosorter.extract_date_from_json(output, logger, "/tmp/file.jpg") is None
+    assert extract_date(output, logger) is None
     assert "No valid date" in collector.messages[-1]
 
 
@@ -390,6 +397,12 @@ def make_stub_session():
             StubSession.get_calls += 1
             return datetime(2020, 1, 2, 3, 4, 5)
 
+        def get_content_identifier(self, _file_path: str):
+            return None
+
+        def clear_cache(self):
+            pass
+
     return StubSession
 
 
@@ -479,7 +492,11 @@ def test_main_does_not_resort_destination_inside_source(monkeypatch, tmp_path):
 
 
 def group_names(directory, names):
-    groups, untouched = photosorter.group_directory_files(str(directory), names)
+    return group_names_with(directory, names, photosorter.match_live_photo_by_name)
+
+
+def group_names_with(directory, names, matcher):
+    groups, untouched = photosorter.group_directory_files(str(directory), names, matcher)
     as_names = {
         os.path.basename(g.main): sorted(os.path.basename(c) for c in g.companions)
         for g in groups
@@ -599,6 +616,7 @@ def test_process_group_photo_without_date_is_unclassified(tmp_path):
 def test_get_date_taken_requests_quicktime_utc_and_creation_date(monkeypatch):
     session = photosorter.ExifToolSession.__new__(photosorter.ExifToolSession)
     session.logger = make_logger()
+    session._tags_cache = {}
     sent: list[list[str]] = []
 
     def fake_execute(args):
@@ -610,6 +628,13 @@ def test_get_date_taken_requests_quicktime_utc_and_creation_date(monkeypatch):
     assert session.get_date_taken("/tmp/clip.mov") == datetime(2023, 12, 31, 23, 30, 0)
     assert sent[0][:3] == ["-j", "-api", "QuickTimeUTC"]
     assert "-CreationDate" in sent[0]
+    assert "-ContentIdentifier" in sent[0]
+    # Cached: the Live Photo check and the date share a single exiftool call.
+    assert session.get_content_identifier("/tmp/clip.mov") is None
+    assert len(sent) == 1
+    session.clear_cache()
+    session.get_date_taken("/tmp/clip.mov")
+    assert len(sent) == 2
 
 
 # --- main: walk, summary, exit code ---------------------------------------------------------
@@ -668,13 +693,14 @@ def test_find_target_counts_planned_targets_as_taken(tmp_path):
         path.parent.mkdir()
         path.write_text(content)
     target = str(tmp_path / "dest" / "photo.jpg")
-    planned = {target: str(first)}
+    index = photosorter.DestinationIndex()
+    index.add(target, str(first), dry_run=True)
 
-    assert photosorter.find_target(str(second), target, planned) == (
+    assert photosorter.find_target(str(second), target, index) == (
         str(tmp_path / "dest" / "photo_1.jpg"),
         False,
     )
-    assert photosorter.find_target(str(first), target, planned) == (target, True)
+    assert photosorter.find_target(str(first), target, index) == (target, True)
 
 
 @pytest.mark.parametrize(
@@ -695,7 +721,7 @@ def test_dry_run_gives_same_named_files_distinct_targets(
         path.parent.mkdir()
         path.write_text(content)
 
-    planned: dict[str, str] = {}
+    index = photosorter.DestinationIndex()
     outcomes = [
         photosorter.process_group(
             photosorter.MediaGroup(str(path)),
@@ -704,13 +730,13 @@ def test_dry_run_gives_same_named_files_distinct_targets(
             dry_run=True,
             copy_files=False,
             session=FakeSession(datetime(2020, 1, 2)),
-            planned=planned,
+            index=index,
         )
         for path in sources
     ]
 
     assert outcomes == expected_outcomes
-    assert sorted(os.path.basename(target) for target in planned) == expected_targets
+    assert sorted(os.path.basename(target) for target in index.planned) == expected_targets
     assert not (tmp_path / "dest").exists()
 
 
@@ -774,3 +800,134 @@ def test_main_removes_emptied_source_directories_only_when_moving(
     assert photosorter.main() == 0
     assert album.exists() is not removed
     assert source_dir.exists()
+
+
+# --- duplicates under another name -------------------------------------------------------
+
+
+def test_destination_index_finds_identical_file_under_another_name(tmp_path):
+    destination = tmp_path / "dest"
+    (destination / "2019" / "05" / "JPG").mkdir(parents=True)
+    (destination / "2019" / "05" / "JPG" / "IMG_0001 (1).jpg").write_text("same bytes")
+    (destination / "2019" / "05" / "JPG" / "other.jpg").write_text("same size!")
+    (destination / ".@__thumb").mkdir()
+    (destination / ".@__thumb" / "thumb.jpg").write_text("other")
+    source = tmp_path / "IMG_0001.jpg"
+    source.write_text("same bytes")
+    different = tmp_path / "different.jpg"
+    different.write_text("diff bytes")
+
+    index = photosorter.DestinationIndex.scan(str(destination), excluded=str(tmp_path / "src"))
+
+    assert len(index) == 2
+    assert index.find_identical(str(source)) == str(
+        destination / "2019" / "05" / "JPG" / "IMG_0001 (1).jpg"
+    )
+    assert index.find_identical(str(different)) is None
+
+
+def test_destination_index_skips_source_nested_in_destination(tmp_path):
+    destination = tmp_path / "photos"
+    source = destination / "import"
+    source.mkdir(parents=True)
+    (source / "photo.jpg").write_text("data")
+
+    index = photosorter.DestinationIndex.scan(str(destination), excluded=str(source))
+
+    assert len(index) == 0
+    assert index.find_identical(str(source / "photo.jpg")) is None
+
+
+def test_process_group_skips_duplicate_with_another_name_without_reading_metadata(tmp_path):
+    destination = tmp_path / "dest"
+    existing = destination / "2020" / "01" / "JPG" / "renamed.jpg"
+    existing.parent.mkdir(parents=True)
+    existing.write_text("same bytes")
+    source = tmp_path / "photo.jpg"
+    source.write_text("same bytes")
+    collector = MessageCollector()
+    logger = make_logger()
+    logger.addHandler(collector)
+
+    outcome = photosorter.process_group(
+        photosorter.MediaGroup(str(source)),
+        str(destination),
+        logger,
+        dry_run=False,
+        copy_files=False,
+        session=FailingSession(),
+        index=photosorter.DestinationIndex.scan(str(destination), excluded=str(tmp_path / "x")),
+    )
+
+    assert outcome == "duplicate"
+    assert source.exists()
+    assert str(existing) in collector.messages[-1]
+
+
+def test_main_skips_duplicates_already_sorted_under_another_name(monkeypatch, tmp_path):
+    source_dir = tmp_path / "source"
+    destination_dir = tmp_path / "dest"
+    source_dir.mkdir()
+    (source_dir / "IMG_0001.jpg").write_text("same bytes")
+    (source_dir / "IMG_0002.jpg").write_text("new photo")
+    existing = destination_dir / "2018" / "IMG_0001_backup.jpg"
+    existing.parent.mkdir(parents=True)
+    existing.write_text("same bytes")
+
+    exit_code, stub = run_main(monkeypatch, source_dir, destination_dir)
+
+    assert exit_code == 0
+    assert stub.get_calls == 1
+    assert (source_dir / "IMG_0001.jpg").exists()
+    assert (destination_dir / "2020" / "01" / "JPG" / "IMG_0002.jpg").exists()
+
+
+# --- Live Photo ContentIdentifier --------------------------------------------------------
+
+
+class ContentIdSession:
+    def __init__(self, identifiers: dict[str, str | None]):
+        self.identifiers = identifiers
+        self.reads: list[str] = []
+
+    def get_content_identifier(self, file_path: str) -> str | None:
+        self.reads.append(os.path.basename(file_path))
+        return self.identifiers.get(os.path.basename(file_path))
+
+
+@pytest.mark.parametrize(
+    ("video", "identifiers", "paired"),
+    [
+        ("IMG_0001.MOV", {"IMG_0001.HEIC": "ABC", "IMG_0001.MOV": "ABC"}, True),
+        ("IMG_0001.MOV", {"IMG_0001.HEIC": "ABC", "IMG_0001.MOV": "XYZ"}, False),
+        ("IMG_0001.MOV", {}, True),
+        ("IMG_0001.MOV", {"IMG_0001.HEIC": "ABC"}, True),
+        ("IMG_0001.MP4", {"IMG_0001.HEIC": "ABC", "IMG_0001.MP4": "ABC"}, True),
+        ("IMG_0001.MP4", {"IMG_0001.HEIC": "ABC"}, False),
+        ("IMG_0001.MP4", {}, False),
+    ],
+)
+def test_live_photo_pairing_checks_content_identifier(tmp_path, video, identifiers, paired):
+    matcher = photosorter.live_photo_matcher(ContentIdSession(identifiers))
+
+    groups, _ = group_names_with(tmp_path, ["IMG_0001.HEIC", video], matcher)
+
+    if paired:
+        assert groups == {"IMG_0001.HEIC": [video]}
+    else:
+        assert groups == {"IMG_0001.HEIC": [], video: []}
+
+
+def test_live_photo_matcher_reads_video_only_when_photo_has_an_identifier(tmp_path):
+    session = ContentIdSession({})
+    matcher = photosorter.live_photo_matcher(session)
+
+    assert matcher(str(tmp_path / "IMG_0001.HEIC"), str(tmp_path / "IMG_0001.MOV")) is True
+    assert session.reads == ["IMG_0001.HEIC"]
+
+
+def test_live_photo_matcher_falls_back_to_name_when_exiftool_fails(tmp_path):
+    matcher = photosorter.live_photo_matcher(FailingSession())
+
+    assert matcher(str(tmp_path / "a.HEIC"), str(tmp_path / "a.MOV")) is True
+    assert matcher(str(tmp_path / "a.HEIC"), str(tmp_path / "a.MP4")) is False
