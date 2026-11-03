@@ -654,4 +654,123 @@ def test_main_returns_error_code_and_logs_summary(monkeypatch, tmp_path):
     assert (source_dir / "photo.jpg").exists()
     summary = collector.messages[-1]
     assert summary.startswith("Summary: 0 sorted")
-    assert "1 non-media files left in place, 1 errors" in summary
+    assert "1 non-media files left in place, 0 empty directories removed, 1 errors" in summary
+    assert not (tmp_path / "dest").exists()
+
+
+# --- dry-run collisions, emptied source directories -----------------------------------------
+
+
+def test_find_target_counts_planned_targets_as_taken(tmp_path):
+    first = tmp_path / "a" / "photo.jpg"
+    second = tmp_path / "b" / "photo.jpg"
+    for path, content in [(first, "first"), (second, "second")]:
+        path.parent.mkdir()
+        path.write_text(content)
+    target = str(tmp_path / "dest" / "photo.jpg")
+    planned = {target: str(first)}
+
+    assert photosorter.find_target(str(second), target, planned) == (
+        str(tmp_path / "dest" / "photo_1.jpg"),
+        False,
+    )
+    assert photosorter.find_target(str(first), target, planned) == (target, True)
+
+
+@pytest.mark.parametrize(
+    ("second_content", "expected_targets", "expected_outcomes"),
+    [
+        ("other bytes", ["photo.jpg", "photo_1.jpg"], ["sorted", "sorted"]),
+        ("same bytes", ["photo.jpg"], ["sorted", "duplicate"]),
+    ],
+)
+def test_dry_run_gives_same_named_files_distinct_targets(
+    tmp_path, second_content, expected_targets, expected_outcomes
+):
+    logger = make_logger()
+    collector = MessageCollector()
+    logger.addHandler(collector)
+    sources = [tmp_path / "a" / "photo.jpg", tmp_path / "b" / "photo.jpg"]
+    for path, content in zip(sources, ["same bytes", second_content]):
+        path.parent.mkdir()
+        path.write_text(content)
+
+    planned: dict[str, str] = {}
+    outcomes = [
+        photosorter.process_group(
+            photosorter.MediaGroup(str(path)),
+            str(tmp_path / "dest"),
+            logger,
+            dry_run=True,
+            copy_files=False,
+            session=FakeSession(datetime(2020, 1, 2)),
+            planned=planned,
+        )
+        for path in sources
+    ]
+
+    assert outcomes == expected_outcomes
+    assert sorted(os.path.basename(target) for target in planned) == expected_targets
+    assert not (tmp_path / "dest").exists()
+
+
+def test_remove_emptied_directories_climbs_to_source_root(tmp_path):
+    source = tmp_path / "source"
+    emptied = source / "2019" / "trip"
+    emptied.mkdir(parents=True)
+    (emptied / ".DS_Store").write_text("junk")
+    (emptied / "Thumbs.db").write_text("junk")
+    (source / "2019" / "._trip").write_text("junk")
+
+    removed = photosorter.remove_emptied_directories({str(emptied)}, str(source), make_logger())
+
+    assert removed == 2
+    assert not (source / "2019").exists()
+    assert source.exists()
+
+
+@pytest.mark.parametrize("blocker", ["notes.txt", ".@__thumb/"])
+def test_remove_emptied_directories_keeps_directories_with_content(tmp_path, blocker):
+    source = tmp_path / "source"
+    emptied = source / "trip"
+    emptied.mkdir(parents=True)
+    if blocker.endswith("/"):
+        (emptied / blocker.rstrip("/")).mkdir()
+    else:
+        (emptied / blocker).write_text("keep me")
+
+    assert photosorter.remove_emptied_directories({str(emptied)}, str(source), make_logger()) == 0
+    assert (emptied / blocker.rstrip("/")).exists()
+
+
+@pytest.mark.parametrize(
+    ("copy_files", "dry_run", "removed"),
+    [(False, False, True), (True, False, False), (False, True, False)],
+)
+def test_main_removes_emptied_source_directories_only_when_moving(
+    monkeypatch, tmp_path, copy_files, dry_run, removed
+):
+    source_dir = tmp_path / "source"
+    album = source_dir / "album"
+    album.mkdir(parents=True)
+    (album / "photo.jpg").write_text("data")
+    (album / ".DS_Store").write_text("junk")
+
+    stub = make_stub_session()
+    monkeypatch.setattr(photosorter, "ExifToolSession", stub)
+    monkeypatch.setattr(photosorter.shutil, "which", lambda _cmd: "/usr/bin/exiftool")
+    monkeypatch.setattr(
+        photosorter,
+        "parse_args",
+        lambda: argparse.Namespace(
+            source_directory=str(source_dir),
+            destination_directory=str(tmp_path / "dest"),
+            dry_run=dry_run,
+            copy=copy_files,
+            log_file=None,
+        ),
+    )
+
+    assert photosorter.main() == 0
+    assert album.exists() is not removed
+    assert source_dir.exists()

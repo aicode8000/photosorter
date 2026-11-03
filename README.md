@@ -20,8 +20,9 @@ Photo/video sorter using ExifTool.
 | Autre fichier (`.txt`, `.pdf`, sidecar orphelin…) | laissé dans la source |
 
 Les fichiers et dossiers système (`.DS_Store`, `Thumbs.db`, `.@__thumb`, `@eaDir`…)
-sont ignorés. Un bilan est affiché en fin de traitement ; le code de sortie vaut 1
-si des erreurs sont survenues.
+sont ignorés. En mode déplacement, les dossiers de la source vidés par le tri sont
+supprimés (s'ils ne contiennent plus que des fichiers système). Un bilan est affiché
+en fin de traitement ; le code de sortie vaut 1 si des erreurs sont survenues.
 
 ## Usage
 

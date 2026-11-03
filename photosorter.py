@@ -395,20 +395,27 @@ def same_content(path_a: str, path_b: str) -> bool:
     )
 
 
-def find_target(source_file: str, target_file: str) -> tuple[str, bool]:
+def find_target(
+    source_file: str, target_file: str, planned: dict[str, str] | None = None
+) -> tuple[str, bool]:
     """Return a free target path, or (existing path, True) if an identical copy is there.
 
     Identical copies are looked for under the same name and its "_N" variants, so that
-    re-running the sorter on the same files does nothing.
+    re-running the sorter on the same files does nothing. `planned` maps targets already
+    claimed during this run to their source file: in dry-run nothing is written, so this
+    is what keeps two same-named files from being shown the same destination.
     """
+    planned = planned or {}
     name, extension = os.path.splitext(target_file)
     candidate, counter = target_file, 0
-    while os.path.exists(candidate):
-        if same_content(source_file, candidate):
+    while True:
+        occupant = candidate if os.path.exists(candidate) else planned.get(candidate)
+        if occupant is None:
+            return candidate, False
+        if same_content(source_file, occupant):
             return candidate, True
         counter += 1
         candidate = f"{name}_{counter}{extension}"
-    return candidate, False
 
 
 def companion_target(companion: str, main: str, main_target: str) -> str:
@@ -428,8 +435,13 @@ def process_group(
     dry_run: bool,
     copy_files: bool,
     session: ExifToolSession,
+    planned: dict[str, str] | None = None,
 ) -> str:
-    """Sort one group. Returns the outcome: sorted, unclassified, duplicate or error."""
+    """Sort one group. Returns the outcome: sorted, unclassified, duplicate or error.
+
+    `planned` (target -> source) is updated with every transfer, see find_target().
+    """
+    planned = {} if planned is None else planned
     file_path = group.main
     if not os.path.isfile(file_path):
         logger.warning("Skipping missing or unsupported file: %s", file_path)
@@ -440,7 +452,7 @@ def process_group(
     try:
         destination_path = resolve_destination(file_path, destination_directory, session)
         main_target, duplicate = find_target(
-            file_path, os.path.join(destination_path, os.path.basename(file_path))
+            file_path, os.path.join(destination_path, os.path.basename(file_path)), planned
         )
         if duplicate:
             logger.info("Duplicate, left in place: %s (same as %s)", file_path, main_target)
@@ -449,7 +461,7 @@ def process_group(
         transfers = [(file_path, main_target)]
         for companion in group.companions:
             target, duplicate = find_target(
-                companion, companion_target(companion, file_path, main_target)
+                companion, companion_target(companion, file_path, main_target), planned
             )
             if duplicate:
                 logger.info("Duplicate, left in place: %s (same as %s)", companion, target)
@@ -457,6 +469,7 @@ def process_group(
                 transfers.append((companion, target))
 
         for source, target in transfers:
+            planned[target] = source
             if dry_run:
                 logger.info("Dry run: %s %s -> %s", operation, source, target)
                 continue
@@ -482,17 +495,52 @@ def process_group(
     return "sorted"
 
 
+def remove_emptied_directories(
+    directories: set[str], source_root: str, logger: logging.Logger
+) -> int:
+    """Remove source directories left empty by the move, then their empty parents.
+
+    A directory counts as empty when it only holds system files (.DS_Store, ._*, Thumbs.db),
+    which are deleted with it. Any other file or sub-directory keeps it. The source root
+    itself is never removed. Returns the number of directories removed.
+    """
+    source_arg, source_root = source_root, os.path.abspath(source_root)
+    removed = 0
+    for directory in sorted(directories, key=lambda d: d.count(os.sep), reverse=True):
+        current = os.path.abspath(directory)
+        while current != source_root and current.startswith(source_root + os.sep):
+            try:
+                entries = [os.path.join(current, entry) for entry in os.listdir(current)]
+                if not all(
+                    os.path.isfile(entry) and is_junk_file(os.path.basename(entry))
+                    for entry in entries
+                ):
+                    break
+                for entry in entries:
+                    os.remove(entry)
+                os.rmdir(current)
+            except OSError as exc:
+                logger.warning("Could not remove empty directory %s: %s", current, exc)
+                break
+            shown = os.path.join(source_arg, os.path.relpath(current, source_root))
+            logger.info("Removed empty directory: %s", shown)
+            removed += 1
+            current = os.path.dirname(current)
+    return removed
+
+
 def log_summary(logger: logging.Logger, stats: Counter[str], copy_files: bool) -> None:
     verb = "copied" if copy_files else "moved"
     logger.info(
         "Summary: %d sorted, %d %s to %s, %d duplicates left in place, "
-        "%d non-media files left in place, %d errors",
+        "%d non-media files left in place, %d empty directories removed, %d errors",
         stats["sorted"],
         stats["unclassified"],
         verb,
         UNCLASSIFIED_DIRECTORY,
         stats["duplicate"],
         stats["ignored"],
+        stats["removed_directories"],
         stats["error"],
     )
 
@@ -533,9 +581,6 @@ def main() -> int:
         logger.error("Source and destination must be different directories")
         return 1
 
-    if not args.dry_run:
-        os.makedirs(destination, exist_ok=True)
-
     try:
         session = ExifToolSession(logger)
     except OSError as exc:
@@ -543,6 +588,8 @@ def main() -> int:
         return 1
 
     stats: Counter[str] = Counter()
+    planned: dict[str, str] = {}
+    emptied_directories: set[str] = set()
     try:
         with session:
             for root, dirs, files in os.walk(source):
@@ -565,12 +612,19 @@ def main() -> int:
                         dry_run=args.dry_run,
                         copy_files=args.copy,
                         session=session,
+                        planned=planned,
                     )
                     stats[outcome] += 1
+                    if outcome in ("sorted", "unclassified"):
+                        emptied_directories.add(root)
     except OSError as exc:
         logger.error("Failed while processing files: %s", exc)
         return 1
 
+    if not args.copy and not args.dry_run:
+        stats["removed_directories"] = remove_emptied_directories(
+            emptied_directories, source, logger
+        )
     log_summary(logger, stats, args.copy)
     return 1 if stats["error"] else 0
 
