@@ -239,15 +239,15 @@ def test_exiftool_session_restarts_dead_process(monkeypatch):
     assert "restarting session" in collector.messages[0]
 
 
-def test_move_or_copy_file_dry_run(tmp_path):
+def test_process_group_file_dry_run(tmp_path):
     logger = make_logger()
     source = tmp_path / "photo.jpg"
     source.write_text("data")
 
     session = FakeSession(datetime(2020, 1, 2, 3, 4, 5))
     destination_root = tmp_path / "dest"
-    photosorter.move_or_copy_file(
-        str(source),
+    photosorter.process_group(
+        photosorter.MediaGroup(str(source)),
         str(destination_root),
         logger,
         dry_run=True,
@@ -259,15 +259,15 @@ def test_move_or_copy_file_dry_run(tmp_path):
     assert not destination_root.exists()
 
 
-def test_move_or_copy_file_copy(tmp_path):
+def test_process_group_file_copy(tmp_path):
     logger = make_logger()
     source = tmp_path / "photo.jpg"
     source.write_text("data")
 
     session = FakeSession(datetime(2020, 1, 2, 3, 4, 5))
     destination_root = tmp_path / "dest"
-    photosorter.move_or_copy_file(
-        str(source),
+    photosorter.process_group(
+        photosorter.MediaGroup(str(source)),
         str(destination_root),
         logger,
         dry_run=False,
@@ -280,7 +280,7 @@ def test_move_or_copy_file_copy(tmp_path):
     assert expected.exists()
 
 
-def test_move_or_copy_video_uses_year_videos(tmp_path):
+def test_process_group_video_uses_year_videos(tmp_path):
     logger = make_logger()
     source = tmp_path / "clip.mp4"
     source.write_text("data")
@@ -289,8 +289,8 @@ def test_move_or_copy_video_uses_year_videos(tmp_path):
 
     session = FakeSession(None)
     destination_root = tmp_path / "dest"
-    photosorter.move_or_copy_file(
-        str(source),
+    photosorter.process_group(
+        photosorter.MediaGroup(str(source)),
         str(destination_root),
         logger,
         dry_run=False,
@@ -304,7 +304,7 @@ def test_move_or_copy_video_uses_year_videos(tmp_path):
 
 
 @pytest.mark.parametrize("file_name", ["photo.jpg", "clip.mp4"])
-def test_move_or_copy_leaves_file_in_place_when_exiftool_fails(tmp_path, file_name):
+def test_process_group_leaves_file_in_place_when_exiftool_fails(tmp_path, file_name):
     logger = make_logger()
     collector = MessageCollector()
     logger.addHandler(collector)
@@ -312,8 +312,8 @@ def test_move_or_copy_leaves_file_in_place_when_exiftool_fails(tmp_path, file_na
     source.write_text("data")
     destination_root = tmp_path / "dest"
 
-    photosorter.move_or_copy_file(
-        str(source),
+    photosorter.process_group(
+        photosorter.MediaGroup(str(source)),
         str(destination_root),
         logger,
         dry_run=False,
@@ -326,14 +326,14 @@ def test_move_or_copy_leaves_file_in_place_when_exiftool_fails(tmp_path, file_na
     assert "exiftool failed" in collector.messages[-1]
 
 
-def test_move_or_copy_skips_missing_file(tmp_path):
+def test_process_group_skips_missing_file(tmp_path):
     logger = make_logger()
     collector = MessageCollector()
     logger.addHandler(collector)
     destination_root = tmp_path / "dest"
 
-    photosorter.move_or_copy_file(
-        str(tmp_path / "missing.mp4"),
+    photosorter.process_group(
+        photosorter.MediaGroup(str(tmp_path / "missing.mp4")),
         str(destination_root),
         logger,
         dry_run=False,
@@ -345,7 +345,7 @@ def test_move_or_copy_skips_missing_file(tmp_path):
     assert "Skipping missing or unsupported file" in collector.messages[0]
 
 
-def test_move_or_copy_skips_file_that_disappears_during_processing(monkeypatch, tmp_path):
+def test_process_group_skips_file_that_disappears_during_processing(monkeypatch, tmp_path):
     logger = make_logger()
     collector = MessageCollector()
     logger.addHandler(collector)
@@ -358,8 +358,8 @@ def test_move_or_copy_skips_file_that_disappears_during_processing(monkeypatch, 
 
     monkeypatch.setattr(photosorter.os.path, "getmtime", missing_file)
 
-    photosorter.move_or_copy_file(
-        str(source),
+    photosorter.process_group(
+        photosorter.MediaGroup(str(source)),
         str(tmp_path / "dest"),
         logger,
         dry_run=False,
@@ -393,8 +393,8 @@ def make_stub_session():
     return StubSession
 
 
-def run_main(monkeypatch, source_dir, destination_dir, dry_run=False):
-    stub = make_stub_session()
+def run_main(monkeypatch, source_dir, destination_dir, dry_run=False, stub=None):
+    stub = stub or make_stub_session()
     monkeypatch.setattr(photosorter, "ExifToolSession", stub)
     monkeypatch.setattr(photosorter.shutil, "which", lambda _cmd: "/usr/bin/exiftool")
     monkeypatch.setattr(
@@ -473,3 +473,185 @@ def test_main_does_not_resort_destination_inside_source(monkeypatch, tmp_path):
     assert already_sorted.exists()
     assert (destination_dir / "2020" / "01" / "JPG" / "photo.jpg").exists()
     assert not (destination_dir / "2020" / "01" / "JPG" / "photo_1.jpg").exists()
+
+
+# --- grouping of sidecars, Live Photos and non-media files ---------------------------------
+
+
+def group_names(directory, names):
+    groups, untouched = photosorter.group_directory_files(str(directory), names)
+    as_names = {
+        os.path.basename(g.main): sorted(os.path.basename(c) for c in g.companions)
+        for g in groups
+    }
+    return as_names, sorted(os.path.basename(p) for p in untouched)
+
+
+def test_group_attaches_sidecars_to_raw_of_raw_jpeg_pair(tmp_path):
+    groups, untouched = group_names(
+        tmp_path, ["DSC_0001.NEF", "DSC_0001.JPG", "DSC_0001.xmp", "DSC_0001.NEF.dop"]
+    )
+    assert groups == {"DSC_0001.JPG": [], "DSC_0001.NEF": ["DSC_0001.NEF.dop", "DSC_0001.xmp"]}
+    assert untouched == []
+
+
+def test_group_attaches_live_photo_video_and_aae_to_heic(tmp_path):
+    groups, _ = group_names(tmp_path, ["IMG_0001.HEIC", "IMG_0001.MOV", "IMG_0001.AAE"])
+    assert groups == {"IMG_0001.HEIC": ["IMG_0001.AAE", "IMG_0001.MOV"]}
+
+
+def test_group_keeps_mov_standalone_when_only_a_raw_shares_its_name(tmp_path):
+    groups, _ = group_names(tmp_path, ["DSC_0001.NEF", "DSC_0001.MOV"])
+    assert groups == {"DSC_0001.MOV": [], "DSC_0001.NEF": []}
+
+
+def test_group_leaves_non_media_and_orphan_sidecars_and_hides_junk(tmp_path):
+    groups, untouched = group_names(
+        tmp_path,
+        ["photo.jpg", "notes.txt", "orphan.xmp", ".DS_Store", "._photo.jpg", "Thumbs.db"],
+    )
+    assert groups == {"photo.jpg": []}
+    assert untouched == ["notes.txt", "orphan.xmp"]
+
+
+@pytest.mark.parametrize(
+    ("file_name", "folder"),
+    [("a.jpeg", "JPG"), ("a.JPG", "JPG"), ("a.heif", "HEIC"), ("a.tif", "TIFF"), ("a.nef", "NEF")],
+)
+def test_extension_folder_merges_aliases(file_name, folder):
+    assert photosorter.extension_folder(file_name) == folder
+
+
+# --- process_group: companions, collisions, duplicates -------------------------------------
+
+
+def run_group(group, destination_root, date=datetime(2020, 1, 2, 3, 4, 5), copy_files=False):
+    return photosorter.process_group(
+        group,
+        str(destination_root),
+        make_logger(),
+        dry_run=False,
+        copy_files=copy_files,
+        session=FakeSession(date),
+    )
+
+
+def test_process_group_moves_companions_and_renames_them_on_collision(tmp_path):
+    source = tmp_path / "src"
+    source.mkdir()
+    for name in ["DSC_0001.NEF", "DSC_0001.xmp", "DSC_0001.NEF.dop"]:
+        (source / name).write_text(f"new {name}")
+    target_dir = tmp_path / "dest" / "2020" / "01" / "NEF"
+    target_dir.mkdir(parents=True)
+    (target_dir / "DSC_0001.NEF").write_text("another photo with the same name")
+
+    group = photosorter.MediaGroup(
+        str(source / "DSC_0001.NEF"),
+        [str(source / "DSC_0001.xmp"), str(source / "DSC_0001.NEF.dop")],
+    )
+
+    assert run_group(group, tmp_path / "dest") == "sorted"
+    assert (target_dir / "DSC_0001_1.NEF").read_text() == "new DSC_0001.NEF"
+    assert (target_dir / "DSC_0001_1.xmp").read_text() == "new DSC_0001.xmp"
+    assert (target_dir / "DSC_0001_1.NEF.dop").read_text() == "new DSC_0001.NEF.dop"
+    assert list(source.iterdir()) == []
+
+
+def test_process_group_puts_live_photo_video_next_to_photo(tmp_path):
+    (tmp_path / "IMG_0001.HEIC").write_text("photo")
+    (tmp_path / "IMG_0001.MOV").write_text("video")
+    group = photosorter.MediaGroup(
+        str(tmp_path / "IMG_0001.HEIC"), [str(tmp_path / "IMG_0001.MOV")]
+    )
+
+    assert run_group(group, tmp_path / "dest") == "sorted"
+    assert (tmp_path / "dest" / "2020" / "01" / "HEIC" / "IMG_0001.MOV").exists()
+
+
+@pytest.mark.parametrize("existing_name", ["photo.jpg", "photo_1.jpg"])
+def test_process_group_leaves_duplicates_in_place(tmp_path, existing_name):
+    source = tmp_path / "photo.jpg"
+    source.write_text("same bytes")
+    target_dir = tmp_path / "dest" / "2020" / "01" / "JPG"
+    target_dir.mkdir(parents=True)
+    if existing_name != "photo.jpg":
+        (target_dir / "photo.jpg").write_text("different bytes")
+    (target_dir / existing_name).write_text("same bytes")
+
+    assert run_group(photosorter.MediaGroup(str(source)), tmp_path / "dest") == "duplicate"
+    assert source.exists()
+    assert sorted(p.name for p in target_dir.iterdir()) == sorted({"photo.jpg", existing_name})
+
+
+def test_process_group_photo_without_date_is_unclassified(tmp_path):
+    source = tmp_path / "screenshot.png"
+    source.write_text("data")
+
+    assert run_group(photosorter.MediaGroup(str(source)), tmp_path / "dest", date=None) == (
+        "unclassified"
+    )
+    assert (tmp_path / "dest" / "Non_classee" / "screenshot.png").exists()
+
+
+# --- exiftool request -----------------------------------------------------------------------
+
+
+def test_get_date_taken_requests_quicktime_utc_and_creation_date(monkeypatch):
+    session = photosorter.ExifToolSession.__new__(photosorter.ExifToolSession)
+    session.logger = make_logger()
+    sent: list[list[str]] = []
+
+    def fake_execute(args):
+        sent.append(args)
+        return '[{"CreationDate":"2023:12:31 23:30:00+01:00","CreateDate":"2023:12:31 22:30:00"}]'
+
+    monkeypatch.setattr(session, "execute", fake_execute)
+
+    assert session.get_date_taken("/tmp/clip.mov") == datetime(2023, 12, 31, 23, 30, 0)
+    assert sent[0][:3] == ["-j", "-api", "QuickTimeUTC"]
+    assert "-CreationDate" in sent[0]
+
+
+# --- main: walk, summary, exit code ---------------------------------------------------------
+
+
+def test_main_leaves_non_media_and_skips_system_directories(monkeypatch, tmp_path):
+    source_dir = tmp_path / "source"
+    destination_dir = tmp_path / "dest"
+    for directory in [".@__thumb", "@eaDir", "#recycle"]:
+        (source_dir / directory).mkdir(parents=True)
+        (source_dir / directory / "thumb.jpg").write_text("thumbnail")
+    (source_dir / "photo.jpg").write_text("data")
+    (source_dir / "notes.txt").write_text("text")
+    (source_dir / ".DS_Store").write_text("junk")
+
+    exit_code, stub = run_main(monkeypatch, source_dir, destination_dir)
+
+    assert exit_code == 0
+    assert stub.get_calls == 1
+    assert (source_dir / "notes.txt").exists()
+    assert (source_dir / ".DS_Store").exists()
+    assert not (destination_dir / "Non_classee").exists()
+
+
+def test_main_returns_error_code_and_logs_summary(monkeypatch, tmp_path):
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    (source_dir / "photo.jpg").write_text("data")
+    (source_dir / "notes.txt").write_text("text")
+
+    stub = make_stub_session()
+    stub.get_date_taken = FailingSession.get_date_taken
+    collector = MessageCollector()
+    logger = photosorter.setup_logger(None)
+    logger.addHandler(collector)
+    try:
+        exit_code, _ = run_main(monkeypatch, source_dir, tmp_path / "dest", stub=stub)
+    finally:
+        logger.removeHandler(collector)
+
+    assert exit_code == 1
+    assert (source_dir / "photo.jpg").exists()
+    summary = collector.messages[-1]
+    assert summary.startswith("Summary: 0 sorted")
+    assert "1 non-media files left in place, 1 errors" in summary

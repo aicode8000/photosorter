@@ -1,4 +1,5 @@
 import argparse
+import filecmp
 import json
 import logging
 import os
@@ -8,25 +9,55 @@ import shutil
 import subprocess
 import threading
 import time
+from collections import Counter
+from dataclasses import dataclass, field
 from datetime import datetime
 from types import TracebackType
 from typing import TextIO
 
+RAW_EXTENSIONS = {".nef", ".dng", ".cr2", ".cr3", ".arw", ".raf", ".orf", ".rw2"}
 IMAGE_EXTENSIONS = {
     ".jpg",
     ".jpeg",
     ".png",
     ".gif",
     ".bmp",
-    ".nef",
     ".heic",
     ".heif",
+    ".tif",
+    ".tiff",
+    ".webp",
+} | RAW_EXTENSIONS
+VIDEO_EXTENSIONS = {
+    ".mp4",
+    ".mov",
+    ".m4v",
+    ".mts",
+    ".m2ts",
+    ".avi",
+    ".mkv",
+    ".3gp",
+    ".mpg",
+    ".mpeg",
+    ".wmv",
 }
-VIDEO_EXTENSIONS = {".mp4", ".mov", ".mts", ".avi", ".mkv"}
+# Files that only make sense next to their photo: XMP metadata, iOS edits, DxO PhotoLab settings.
+SIDECAR_EXTENSIONS = {".xmp", ".aae", ".dop"}
+# Video half of an Apple Live Photo (IMG_0001.HEIC + IMG_0001.MOV).
+LIVE_PHOTO_VIDEO_EXTENSIONS = {".mov"}
+# Folder names are the extension in upper case, with aliases merged into a single folder.
+EXTENSION_FOLDER_ALIASES = {"JPEG": "JPG", "HEIF": "HEIC", "TIF": "TIFF"}
+# Hidden/system directories: macOS (.Trashes…), QNAP (.@__thumb, @Recycle), Synology (@eaDir…).
+IGNORED_DIRECTORY_PREFIXES = (".", "@", "#")
+UNCLASSIFIED_DIRECTORY = "Non_classee"
+# System files that are silently ignored, like hidden files (.DS_Store, ._*).
+JUNK_FILE_NAMES = {"thumbs.db", "desktop.ini", "icon\r"}
 
 LOGGER_NAME = "photosorter"
 READY_MARKER = "{ready}"
-DATE_TAGS = ("DateTimeOriginal", "CreateDate", "DateCreated")
+# CreationDate (QuickTime Keys, written by iPhones) carries the local time and time zone,
+# so it is preferred over CreateDate for videos.
+DATE_TAGS = ("DateTimeOriginal", "CreationDate", "CreateDate", "DateCreated")
 # Accepts "YYYY:MM:DD HH:MM:SS" plus optional sub-seconds / timezone suffix, or a bare date.
 EXIF_DATE_RE = re.compile(r"^\s*(\d{4})[:-](\d{2})[:-](\d{2})(?:[ T](\d{2}):(\d{2}):(\d{2}))?")
 
@@ -228,7 +259,10 @@ class ExifToolSession:
         return self._read_response(request_target)
 
     def get_date_taken(self, file_path: str) -> datetime | None:
-        output = self.execute(["-j", *(f"-{tag}" for tag in DATE_TAGS), file_path])
+        # QuickTime dates are UTC by spec: QuickTimeUTC converts them to local time.
+        output = self.execute(
+            ["-j", "-api", "QuickTimeUTC", *(f"-{tag}" for tag in DATE_TAGS), file_path]
+        )
         return extract_date_from_json(output, self.logger, file_path)
 
     def close(self) -> None:
@@ -255,31 +289,96 @@ class ExifToolSession:
         self.close()
 
 
-def create_unique_file_name(file_path: str) -> str:
-    counter = 1
-    name, extension = os.path.splitext(file_path)
-    while os.path.exists(f"{name}_{counter}{extension}"):
-        counter += 1
-    return f"{name}_{counter}{extension}"
+@dataclass
+class MediaGroup:
+    """A photo or video plus the files that must travel with it."""
+
+    main: str
+    companions: list[str] = field(default_factory=list)
+
+
+def is_junk_file(name: str) -> bool:
+    return name.startswith(".") or name.lower() in JUNK_FILE_NAMES
+
+
+def is_ignored_directory(name: str) -> bool:
+    return name.startswith(IGNORED_DIRECTORY_PREFIXES)
+
+
+def split_name(file_name: str) -> tuple[str, str]:
+    """Return (lower-case stem, lower-case extension)."""
+    stem, extension = os.path.splitext(file_name)
+    return stem.lower(), extension.lower()
+
+
+def group_directory_files(
+    directory: str, file_names: list[str]
+) -> tuple[list[MediaGroup], list[str]]:
+    """Group the media files of one directory with their sidecars and Live Photo videos.
+
+    Returns the groups to sort and the paths left untouched (non-media, orphan sidecars).
+    System files (.DS_Store, ._*, Thumbs.db) are neither sorted nor reported.
+    """
+    visible = sorted(name for name in file_names if not is_junk_file(name))
+    images = [name for name in visible if split_name(name)[1] in IMAGE_EXTENSIONS]
+    videos = [name for name in visible if split_name(name)[1] in VIDEO_EXTENSIONS]
+    sidecars = [name for name in visible if split_name(name)[1] in SIDECAR_EXTENSIONS]
+
+    groups = {name: MediaGroup(os.path.join(directory, name)) for name in images + videos}
+    images_by_stem: dict[str, list[str]] = {}
+    for name in images:
+        images_by_stem.setdefault(split_name(name)[0], []).append(name)
+
+    def pick(stem: str, candidates: list[str]) -> str | None:
+        # RAW first: XMP/DxO sidecars of a RAW+JPEG pair belong to the RAW file.
+        matches = [name for name in candidates if split_name(name)[0] == stem]
+        matches.sort(key=lambda name: split_name(name)[1] not in RAW_EXTENSIONS)
+        return matches[0] if matches else None
+
+    for name in videos:
+        stem, extension = split_name(name)
+        if extension not in LIVE_PHOTO_VIDEO_EXTENSIONS:
+            continue
+        stills = [i for i in images_by_stem.get(stem, []) if split_name(i)[1] not in RAW_EXTENSIONS]
+        if stills:
+            groups[stills[0]].companions.append(groups.pop(name).main)
+
+    untouched: list[str] = []
+    for name in sidecars:
+        stem = split_name(name)[0]
+        # "DSC_0001.NEF.dop" names its photo exactly; "DSC_0001.xmp" only by stem.
+        owner = next((main for main in groups if main.lower() == stem), None)
+        owner = owner or pick(stem, list(groups))
+        if owner is None:
+            untouched.append(os.path.join(directory, name))
+        else:
+            groups[owner].companions.append(os.path.join(directory, name))
+
+    handled = set(images + videos + sidecars)
+    untouched.extend(os.path.join(directory, name) for name in visible if name not in handled)
+    return list(groups.values()), untouched
+
+
+def extension_folder(file_path: str) -> str:
+    folder = os.path.splitext(file_path)[1][1:].upper()
+    return EXTENSION_FOLDER_ALIASES.get(folder, folder)
 
 
 def resolve_destination(
     file_path: str,
     destination_directory: str,
-    logger: logging.Logger,
     session: ExifToolSession,
 ) -> str:
     if is_image_file(file_path):
         date_taken = session.get_date_taken(file_path)
         if date_taken is not None:
-            file_extension = os.path.splitext(file_path)[1][1:].upper()
             return os.path.join(
                 destination_directory,
                 str(date_taken.year),
                 f"{date_taken.month:02d}",
-                file_extension,
+                extension_folder(file_path),
             )
-        return os.path.join(destination_directory, "Non_classee")
+        return os.path.join(destination_directory, UNCLASSIFIED_DIRECTORY)
     if is_video_file(file_path):
         date_taken = session.get_date_taken(file_path)
         if date_taken is not None:
@@ -287,49 +386,115 @@ def resolve_destination(
 
         modified_year = datetime.fromtimestamp(os.path.getmtime(file_path)).year
         return os.path.join(destination_directory, str(modified_year), "Videos")
-    return os.path.join(destination_directory, "Non_classee")
+    return os.path.join(destination_directory, UNCLASSIFIED_DIRECTORY)
 
 
-def move_or_copy_file(
-    file_path: str,
+def same_content(path_a: str, path_b: str) -> bool:
+    return os.path.getsize(path_a) == os.path.getsize(path_b) and filecmp.cmp(
+        path_a, path_b, shallow=False
+    )
+
+
+def find_target(source_file: str, target_file: str) -> tuple[str, bool]:
+    """Return a free target path, or (existing path, True) if an identical copy is there.
+
+    Identical copies are looked for under the same name and its "_N" variants, so that
+    re-running the sorter on the same files does nothing.
+    """
+    name, extension = os.path.splitext(target_file)
+    candidate, counter = target_file, 0
+    while os.path.exists(candidate):
+        if same_content(source_file, candidate):
+            return candidate, True
+        counter += 1
+        candidate = f"{name}_{counter}{extension}"
+    return candidate, False
+
+
+def companion_target(companion: str, main: str, main_target: str) -> str:
+    """Rename a companion like its main file: DSC_0001.xmp follows DSC_0001.NEF -> DSC_0001_1."""
+    old_stem = os.path.splitext(os.path.basename(main))[0]
+    new_stem = os.path.splitext(os.path.basename(main_target))[0]
+    companion_name = os.path.basename(companion)
+    if companion_name.lower().startswith(old_stem.lower()):
+        companion_name = new_stem + companion_name[len(old_stem) :]
+    return os.path.join(os.path.dirname(main_target), companion_name)
+
+
+def process_group(
+    group: MediaGroup,
     destination_directory: str,
     logger: logging.Logger,
     dry_run: bool,
     copy_files: bool,
     session: ExifToolSession,
-) -> None:
+) -> str:
+    """Sort one group. Returns the outcome: sorted, unclassified, duplicate or error."""
+    file_path = group.main
     if not os.path.isfile(file_path):
         logger.warning("Skipping missing or unsupported file: %s", file_path)
-        return
+        return "error"
 
     operation = "copy" if copy_files else "move"
+    transfer = shutil.copy2 if copy_files else shutil.move
     try:
-        destination_path = resolve_destination(file_path, destination_directory, logger, session)
-        destination_file = os.path.join(destination_path, os.path.basename(file_path))
+        destination_path = resolve_destination(file_path, destination_directory, session)
+        main_target, duplicate = find_target(
+            file_path, os.path.join(destination_path, os.path.basename(file_path))
+        )
+        if duplicate:
+            logger.info("Duplicate, left in place: %s (same as %s)", file_path, main_target)
+            return "duplicate"
 
-        if os.path.exists(destination_file):
-            destination_file = create_unique_file_name(destination_file)
+        transfers = [(file_path, main_target)]
+        for companion in group.companions:
+            target, duplicate = find_target(
+                companion, companion_target(companion, file_path, main_target)
+            )
+            if duplicate:
+                logger.info("Duplicate, left in place: %s (same as %s)", companion, target)
+            else:
+                transfers.append((companion, target))
 
-        if dry_run:
-            logger.info("Dry run: %s %s -> %s", operation, file_path, destination_file)
-            return
-
-        os.makedirs(destination_path, exist_ok=True)
-
-        if copy_files:
-            shutil.copy2(file_path, destination_file)
-        else:
-            shutil.move(file_path, destination_file)
-        logger.info("%s: %s -> %s", operation.capitalize(), file_path, destination_file)
+        for source, target in transfers:
+            if dry_run:
+                logger.info("Dry run: %s %s -> %s", operation, source, target)
+                continue
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            transfer(source, target)
+            logger.info("%s: %s -> %s", operation.capitalize(), source, target)
     except ExifToolError as exc:
         # Unknown date is not "no date": leave the file in place rather than misfile it.
         logger.error("Skipping %s, exiftool failed: %s", file_path, exc)
+        return "error"
     except FileNotFoundError:
         logger.warning("Skipping file that disappeared during processing: %s", file_path)
+        return "error"
     except PermissionError as exc:
         logger.error("Permission error for %s: %s", file_path, exc)
+        return "error"
     except OSError as exc:
         logger.error("Failed to %s %s: %s", operation, file_path, exc)
+        return "error"
+
+    if os.path.basename(destination_path) == UNCLASSIFIED_DIRECTORY:
+        return "unclassified"
+    return "sorted"
+
+
+def log_summary(logger: logging.Logger, stats: Counter[str], copy_files: bool) -> None:
+    verb = "copied" if copy_files else "moved"
+    logger.info(
+        "Summary: %d sorted, %d %s to %s, %d duplicates left in place, "
+        "%d non-media files left in place, %d errors",
+        stats["sorted"],
+        stats["unclassified"],
+        verb,
+        UNCLASSIFIED_DIRECTORY,
+        stats["duplicate"],
+        stats["ignored"],
+        stats["error"],
+    )
 
 
 def is_same_path(path_a: str, path_b: str) -> bool:
@@ -377,26 +542,37 @@ def main() -> int:
         logger.error("Failed to start exiftool: %s", exc)
         return 1
 
+    stats: Counter[str] = Counter()
     try:
         with session:
             for root, dirs, files in os.walk(source):
-                # The destination may live inside the source: never re-sort what was just sorted.
-                dirs[:] = [d for d in dirs if not is_same_path(os.path.join(root, d), destination)]
-                for file_name in files:
-                    file_path = os.path.join(root, file_name)
-                    move_or_copy_file(
-                        file_path,
+                # Skip system folders, and never re-sort a destination nested in the source.
+                dirs[:] = sorted(
+                    d
+                    for d in dirs
+                    if not is_ignored_directory(d)
+                    and not is_same_path(os.path.join(root, d), destination)
+                )
+                groups, untouched = group_directory_files(root, files)
+                for path in untouched:
+                    logger.info("Not a media file, left in place: %s", path)
+                stats["ignored"] += len(untouched)
+                for group in groups:
+                    outcome = process_group(
+                        group,
                         destination,
                         logger,
                         dry_run=args.dry_run,
                         copy_files=args.copy,
                         session=session,
                     )
+                    stats[outcome] += 1
     except OSError as exc:
         logger.error("Failed while processing files: %s", exc)
         return 1
 
-    return 0
+    log_summary(logger, stats, args.copy)
+    return 1 if stats["error"] else 0
 
 
 if __name__ == "__main__":
