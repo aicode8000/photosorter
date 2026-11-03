@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import queue
+import re
 import shutil
 import subprocess
 import threading
@@ -25,6 +26,13 @@ VIDEO_EXTENSIONS = {".mp4", ".mov", ".mts", ".avi", ".mkv"}
 
 LOGGER_NAME = "photosorter"
 READY_MARKER = "{ready}"
+DATE_TAGS = ("DateTimeOriginal", "CreateDate", "DateCreated")
+# Accepts "YYYY:MM:DD HH:MM:SS" plus optional sub-seconds / timezone suffix, or a bare date.
+EXIF_DATE_RE = re.compile(r"^\s*(\d{4})[:-](\d{2})[:-](\d{2})(?:[ T](\d{2}):(\d{2}):(\d{2}))?")
+
+
+class ExifToolError(RuntimeError):
+    """Exiftool itself failed (timeout, crash, I/O): the file's date is unknown, not absent."""
 
 
 def setup_logger(log_file: str | None) -> logging.Logger:
@@ -56,7 +64,23 @@ def is_video_file(file_path: str) -> bool:
     return os.path.splitext(file_path)[1].lower() in VIDEO_EXTENSIONS
 
 
-def extract_date_from_json(output: str, logger: logging.Logger, file_path: str) -> str | None:
+def parse_exif_date(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    match = EXIF_DATE_RE.match(value)
+    if not match:
+        return None
+    parts = [int(part) if part is not None else 0 for part in match.groups()]
+    try:
+        return datetime(*parts)
+    except ValueError:
+        # e.g. "0000:00:00 00:00:00" written by cameras with an unset clock
+        return None
+
+
+def extract_date_from_json(
+    output: str, logger: logging.Logger, file_path: str
+) -> datetime | None:
     output = output.strip()
     if not output:
         logger.warning("Exiftool returned empty JSON for %s", file_path)
@@ -68,19 +92,23 @@ def extract_date_from_json(output: str, logger: logging.Logger, file_path: str) 
         logger.warning("Invalid JSON from exiftool for %s: %s", file_path, exc)
         return None
 
-    if not isinstance(exif_data, list) or not exif_data:
+    if not isinstance(exif_data, list) or not exif_data or not isinstance(exif_data[0], dict):
         logger.warning("Unexpected JSON structure from exiftool for %s", file_path)
         return None
 
-    date_taken = (
-        exif_data[0].get("DateTimeOriginal")
-        or exif_data[0].get("CreateDate")
-        or exif_data[0].get("DateCreated")
-    )
-    if not date_taken:
-        return None
+    invalid_values = []
+    for tag in DATE_TAGS:
+        value = exif_data[0].get(tag)
+        if value is None:
+            continue
+        parsed = parse_exif_date(value)
+        if parsed is not None:
+            return parsed
+        invalid_values.append(f"{tag}={value!r}")
 
-    return date_taken
+    if invalid_values:
+        logger.warning("No valid date for %s (%s)", file_path, ", ".join(invalid_values))
+    return None
 
 
 class ExifToolSession:
@@ -138,7 +166,7 @@ class ExifToolSession:
 
     def _write_lines(self, lines: list[str]) -> None:
         if not self.process.stdin:
-            raise RuntimeError("Exiftool stdin is not available")
+            raise ExifToolError("exiftool stdin is not available")
         for line in lines:
             self.process.stdin.write(line + "\n")
         self.process.stdin.flush()
@@ -158,25 +186,16 @@ class ExifToolSession:
         deadline = time.monotonic() + self.command_timeout
         while True:
             remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                self.logger.error(
-                    "Exiftool timed out after %.1f seconds while processing %s",
-                    self.command_timeout,
-                    request_target,
-                )
-                self._terminate_process()
-                return ""
-
             try:
+                if remaining <= 0:
+                    raise queue.Empty
                 line = self.stdout_queue.get(timeout=remaining)
             except queue.Empty:
-                self.logger.error(
-                    "Exiftool timed out after %.1f seconds while processing %s",
-                    self.command_timeout,
-                    request_target,
-                )
                 self._terminate_process()
-                return ""
+                raise ExifToolError(
+                    f"exiftool timed out after {self.command_timeout:.1f} seconds "
+                    f"while processing {request_target}"
+                ) from None
 
             if line is None:
                 if self.process.poll() is None:
@@ -184,32 +203,32 @@ class ExifToolSession:
                         self.process.wait(timeout=min(1.0, remaining))
                     except subprocess.TimeoutExpired:
                         continue
-                self.logger.error("Exiftool exited unexpectedly while processing %s", request_target)
-                break
+                raise ExifToolError(
+                    f"exiftool exited unexpectedly while processing {request_target}"
+                )
             if line.strip() == READY_MARKER:
                 break
             response_lines.append(line)
         return "".join(response_lines)
 
     def execute(self, args: list[str]) -> str:
+        """Run one exiftool command. Raises ExifToolError if exiftool itself fails."""
         if self.process.poll() is not None:
             self.logger.warning("Exiftool is not running, restarting session")
             try:
                 self._start_process()
             except OSError as exc:
-                self.logger.error("Failed to restart exiftool: %s", exc)
-                return ""
+                raise ExifToolError(f"failed to restart exiftool: {exc}") from exc
         try:
             self._write_lines(args + ["-execute"])
-            request_target = args[-1] if args else "request"
-            return self._read_response(request_target)
         except OSError as exc:
-            self.logger.error("Failed to communicate with exiftool: %s", exc)
             self._terminate_process()
-            return ""
+            raise ExifToolError(f"failed to communicate with exiftool: {exc}") from exc
+        request_target = args[-1] if args else "request"
+        return self._read_response(request_target)
 
-    def get_date_taken(self, file_path: str) -> str | None:
-        output = self.execute(["-j", "-DateTimeOriginal", "-CreateDate", "-DateCreated", file_path])
+    def get_date_taken(self, file_path: str) -> datetime | None:
+        output = self.execute(["-j", *(f"-{tag}" for tag in DATE_TAGS), file_path])
         return extract_date_from_json(output, self.logger, file_path)
 
     def close(self) -> None:
@@ -253,23 +272,18 @@ def resolve_destination(
     if is_image_file(file_path):
         date_taken = session.get_date_taken(file_path)
         if date_taken is not None:
-            try:
-                parsed_date = datetime.strptime(date_taken, "%Y:%m:%d %H:%M:%S")
-                year = parsed_date.year
-                month_str = str(parsed_date.month).zfill(2)
-                file_extension = os.path.splitext(file_path)[1][1:].upper()
-                return os.path.join(destination_directory, str(year), month_str, file_extension)
-            except ValueError as exc:
-                logger.warning("Invalid DateTimeOriginal for %s: %s", file_path, exc)
+            file_extension = os.path.splitext(file_path)[1][1:].upper()
+            return os.path.join(
+                destination_directory,
+                str(date_taken.year),
+                f"{date_taken.month:02d}",
+                file_extension,
+            )
         return os.path.join(destination_directory, "Non_classee")
     if is_video_file(file_path):
         date_taken = session.get_date_taken(file_path)
         if date_taken is not None:
-            try:
-                parsed_date = datetime.strptime(date_taken, "%Y:%m:%d %H:%M:%S")
-                return os.path.join(destination_directory, str(parsed_date.year), "Videos")
-            except ValueError as exc:
-                logger.warning("Invalid video date for %s: %s", file_path, exc)
+            return os.path.join(destination_directory, str(date_taken.year), "Videos")
 
         modified_year = datetime.fromtimestamp(os.path.getmtime(file_path)).year
         return os.path.join(destination_directory, str(modified_year), "Videos")
@@ -307,12 +321,22 @@ def move_or_copy_file(
         else:
             shutil.move(file_path, destination_file)
         logger.info("%s: %s -> %s", operation.capitalize(), file_path, destination_file)
+    except ExifToolError as exc:
+        # Unknown date is not "no date": leave the file in place rather than misfile it.
+        logger.error("Skipping %s, exiftool failed: %s", file_path, exc)
     except FileNotFoundError:
         logger.warning("Skipping file that disappeared during processing: %s", file_path)
     except PermissionError as exc:
         logger.error("Permission error for %s: %s", file_path, exc)
     except OSError as exc:
         logger.error("Failed to %s %s: %s", operation, file_path, exc)
+
+
+def is_same_path(path_a: str, path_b: str) -> bool:
+    try:
+        return os.path.samefile(path_a, path_b)
+    except OSError:
+        return os.path.realpath(path_a) == os.path.realpath(path_b)
 
 
 def parse_args() -> argparse.Namespace:
@@ -335,8 +359,17 @@ def main() -> int:
         )
         return 1
 
-    if not os.path.exists(args.destination_directory):
-        os.makedirs(args.destination_directory)
+    source = args.source_directory
+    destination = args.destination_directory
+    if not os.path.isdir(source):
+        logger.error("Source directory does not exist: %s", source)
+        return 1
+    if is_same_path(source, destination):
+        logger.error("Source and destination must be different directories")
+        return 1
+
+    if not args.dry_run:
+        os.makedirs(destination, exist_ok=True)
 
     try:
         session = ExifToolSession(logger)
@@ -346,12 +379,14 @@ def main() -> int:
 
     try:
         with session:
-            for root, _, files in os.walk(args.source_directory):
+            for root, dirs, files in os.walk(source):
+                # The destination may live inside the source: never re-sort what was just sorted.
+                dirs[:] = [d for d in dirs if not is_same_path(os.path.join(root, d), destination)]
                 for file_name in files:
                     file_path = os.path.join(root, file_name)
                     move_or_copy_file(
                         file_path,
-                        args.destination_directory,
+                        destination,
                         logger,
                         dry_run=args.dry_run,
                         copy_files=args.copy,
